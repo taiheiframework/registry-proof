@@ -76,6 +76,8 @@ jobs:
           # skew and a margin.
           exp=$(cut -d. -f2 "$dir/own" | tr '_-' '/+' | awk '{ while (length($0) % 4) $0 = $0 "="; print }' \
             | base64 -d | jq -er '.exp')
+          # Checked before bash arithmetic sees it, which would evaluate anything else as code.
+          if ! [[ "$exp" =~ ^[0-9]{1,12}$ ]]; then echo "::error::the token's exp is not a number"; exit 1; fi
           wait=$(( exp - $(date +%s) + 90 ))
           if [ "$wait" -gt 3700 ]; then echo "::error::the token lives longer than expected"; exit 1; fi
           echo "waiting $wait s for the case 1 token to expire (exp $(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ))"
