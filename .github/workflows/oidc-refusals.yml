@@ -1,0 +1,85 @@
+# OIDC tokens the public write gateway must refuse. Each case sends one GitHub Actions OIDC token
+# from this repository to https://up.taihei.dev/ and expects 401; the gateway's own log names the
+# claim that refused it. The workflow writes nothing: every PUT carries an empty body, and no
+# cleared workflow is configured on the gateway, so no token can be accepted.
+#
+# Run by hand (workflow_dispatch) on main. No checkout, no third-party action, no secret, no
+# environment. Every token is masked before anything else is printed and is never echoed.
+# Each case prints one line: its number, the UTC time just before the request, the method and
+# path, the HTTP status and the refusal reason the gateway log must show for it, so the run log
+# can be matched line by line against the gateway log.
+# This file is deleted once its result is recorded, before the repository is archived.
+name: oidc-refusals
+on:
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+jobs:
+  refuse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: refusals
+        shell: bash
+        env:
+          GATEWAY: https://up.taihei.dev/
+          POM: dev/taihei/taihei-registry-proof/0.0.1/taihei-registry-proof-0.0.1.pom
+        run: |
+          set -euo pipefail
+          umask 077
+          # Case 1 means "refused on ref" only for a run dispatched on main.
+          if [ "$GITHUB_REF" != refs/heads/main ] || [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            echo "::error::run this only by workflow_dispatch on main, not $GITHUB_EVENT_NAME on $GITHUB_REF"
+            exit 1
+          fi
+          dir=$(mktemp -d)
+          failed=0
+          # Requests one token for audience $1 into the file $2. The request token goes in on stdin
+          # and the response is kept in a file, never in the log; the token is masked before any
+          # later line can print it.
+          token() {
+            printf 'Authorization: Bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              | curl -sSf --proto '=https' --max-redirs 0 --max-time 30 -H @- \
+                  --get --data-urlencode "audience=$1" "$ACTIONS_ID_TOKEN_REQUEST_URL" -o "$dir/resp"
+            jq -er '.value' "$dir/resp" > "$2"
+            rm -f "$dir/resp"
+            echo "::add-mask::$(cat "$2")"
+          }
+          # Case $1: sends the token in file $3 with method $2 to path $4 and prints one line with
+          # the case, the request time, the status and the reason $5 the gateway log must name.
+          # A status other than 401 fails the run after every case has been tried; a 2xx would be
+          # an acceptance and is flagged as such. Cases are a second apart, so each one has its own
+          # second in the gateway log even where that log has no finer time.
+          send() {
+            local code at
+            at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+            code=$(printf 'Authorization: Bearer %s\n' "$(cat "$3")" \
+              | curl -sS --proto '=https' --max-redirs 0 --max-time 30 -o /dev/null -w '%{http_code}' \
+                  -X "$2" -H @- --data-binary @/dev/null "$GATEWAY$4" || true)
+            echo "case $1 | $at | $2 /$4 | HTTP $code | gateway log must say: $5"
+            case "$code" in
+              401) ;;
+              2??) echo "::error::case $1: the gateway ACCEPTED the token (HTTP $code), a security incident"; failed=1 ;;
+              *) echo "::error::case $1: expected 401, got $code"; failed=1 ;;
+            esac
+            sleep 1
+          }
+          echo "run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, $GITHUB_EVENT_NAME on $GITHUB_REF at $GITHUB_SHA"
+          token "$GATEWAY" "$dir/own"
+          token "https://up.taihei.dev" "$dir/noslash"
+          token "taihei-release-gate" "$dir/gate"
+          send 1 PUT "$dir/own" "$POM" "ref is not refs/tags/v<x.y.z> (repository_id 1438153464, ...)"
+          send 2 PUT "$dir/noslash" "$POM" "aud is not this gateway (audience without the trailing slash)"
+          send 3 PUT "$dir/gate" "$POM" "aud is not this gateway (the gate job's audience taihei-release-gate)"
+          send 4 GET "$dir/own" "_taihei/deployment" "an OIDC token asked for the deployment"
+          # Case 5: the token of case 1 once it has expired, GitHub's exp plus the gateway's 60 s
+          # skew and a margin.
+          exp=$(cut -d. -f2 "$dir/own" | tr '_-' '/+' | awk '{ while (length($0) % 4) $0 = $0 "="; print }' \
+            | base64 -d | jq -er '.exp')
+          wait=$(( exp - $(date +%s) + 90 ))
+          if [ "$wait" -gt 3700 ]; then echo "::error::the token lives longer than expected"; exit 1; fi
+          echo "waiting $wait s for the case 1 token to expire (exp $(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ))"
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          send 5 PUT "$dir/own" "$POM" "expired (the case 1 token)"
+          rm -rf "$dir"
+          exit "$failed"
